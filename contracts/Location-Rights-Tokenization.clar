@@ -14,6 +14,10 @@
 (define-constant err-listing-not-active (err u109))
 (define-constant err-invalid-price (err u110))
 (define-constant err-transfer-failed (err u111))
+(define-constant err-discount-not-found (err u112))
+(define-constant err-discount-expired (err u113))
+(define-constant err-discount-inactive (err u114))
+(define-constant err-min-bookings-not-met (err u115))
 
 (define-constant platform-fee-percentage u3)
 (define-constant max-royalty-percentage u20)
@@ -23,6 +27,7 @@
 (define-data-var location-id-nonce uint u1)
 (define-data-var booking-id-nonce uint u1)
 (define-data-var total-platform-fees uint u0)
+(define-data-var discount-id-nonce uint u1)
 
 (define-map locations uint {
     owner: principal,
@@ -90,6 +95,19 @@
 (define-map owner-locations principal {
     location-ids: (list 50 uint),
     total-earnings: uint
+})
+
+(define-map discounts uint {
+    discount-id: uint,
+    location-id: uint,
+    discount-percentage: uint,
+    valid-from: uint,
+    valid-until: uint,
+    min-bookings: uint,
+    max-uses: uint,
+    current-uses: uint,
+    is-active: bool,
+    created-by: principal
 })
 
 (define-public (mint-location
@@ -288,6 +306,121 @@
     (var-set total-platform-fees u0)
     (ok fees)))
 
+(define-public (create-discount
+    (location-id uint)
+    (discount-percentage uint)
+    (valid-from uint)
+    (valid-until uint)
+    (min-bookings uint)
+    (max-uses uint))
+  (let (
+    (location (unwrap! (map-get? locations location-id) err-location-not-found))
+    (discount-id (var-get discount-id-nonce)))
+    
+    (asserts! (is-eq tx-sender (get owner location)) err-not-authorized)
+    (asserts! (> discount-percentage u0) err-invalid-percentage)
+    (asserts! (<= discount-percentage u100) err-invalid-percentage)
+    (asserts! (> valid-until valid-from) err-invalid-dates)
+    (asserts! (> max-uses u0) err-invalid-percentage)
+    
+    (map-set discounts discount-id {
+        discount-id: discount-id,
+        location-id: location-id,
+        discount-percentage: discount-percentage,
+        valid-from: valid-from,
+        valid-until: valid-until,
+        min-bookings: min-bookings,
+        max-uses: max-uses,
+        current-uses: u0,
+        is-active: true,
+        created-by: tx-sender
+    })
+    
+    (var-set discount-id-nonce (+ discount-id u1))
+    (ok discount-id)))
+
+(define-public (toggle-discount (discount-id uint))
+  (let ((discount (unwrap! (map-get? discounts discount-id) err-discount-not-found)))
+    (asserts! (is-eq tx-sender (get created-by discount)) err-not-authorized)
+    
+    (map-set discounts discount-id
+        (merge discount { is-active: (not (get is-active discount)) }))
+    (ok true)))
+
+(define-public (book-location-with-discount
+    (location-id uint)
+    (start-date uint)
+    (end-date uint)
+    (discount-id uint))
+  (let (
+    (location (unwrap! (map-get? locations location-id) err-location-not-found))
+    (discount (unwrap! (map-get? discounts discount-id) err-discount-not-found))
+    (booking-id (var-get booking-id-nonce))
+    (duration (- end-date start-date))
+    (base-cost (* (get daily-rate location) duration))
+    (user-data (default-to { booking-ids: (list), total-spent: u0 } (map-get? user-bookings tx-sender)))
+    (user-booking-count (len (get booking-ids user-data)))
+    (discount-amount (/ (* base-cost (get discount-percentage discount)) u100))
+    (discounted-cost (- base-cost discount-amount))
+    (platform-fee (/ (* discounted-cost platform-fee-percentage) u100))
+    (owner-payment (- discounted-cost platform-fee))
+    (total-cost discounted-cost))
+    
+    (asserts! (is-eq (get location-id discount) location-id) err-discount-not-found)
+    (asserts! (get is-active discount) err-discount-inactive)
+    (asserts! (>= stacks-block-height (get valid-from discount)) err-discount-expired)
+    (asserts! (<= stacks-block-height (get valid-until discount)) err-discount-expired)
+    (asserts! (< (get current-uses discount) (get max-uses discount)) err-discount-expired)
+    (asserts! (>= user-booking-count (get min-bookings discount)) err-min-bookings-not-met)
+    
+    (asserts! (get is-active location) err-listing-not-active)
+    (asserts! (> end-date start-date) err-invalid-dates)
+    (asserts! (>= duration min-booking-duration) err-invalid-dates)
+    (asserts! (<= duration max-booking-duration) err-invalid-dates)
+    (asserts! (default-to true (get is-available (map-get? location-availability { location-id: location-id, date: start-date }))) err-booking-conflict)
+    
+    (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+    (try! (as-contract (stx-transfer? owner-payment tx-sender (get owner location))))
+    
+    (map-set bookings booking-id {
+        booking-id: booking-id,
+        location-id: location-id,
+        renter: tx-sender,
+        start-date: start-date,
+        end-date: end-date,
+        daily-rate: (get daily-rate location),
+        total-cost: total-cost,
+        status: "confirmed",
+        booked-at: stacks-block-height
+    })
+    
+    (map-set location-availability 
+        { location-id: location-id, date: start-date }
+        { is-available: false, booking-id: (some booking-id) })
+    
+    (map-set locations location-id
+        (merge location { 
+            total-bookings: (+ (get total-bookings location) u1),
+            total-earnings: (+ (get total-earnings location) owner-payment)
+        }))
+    
+    (let ((stats (unwrap! (map-get? location-stats location-id) err-location-not-found)))
+        (map-set location-stats location-id
+            (merge stats {
+                total-bookings: (+ (get total-bookings stats) u1),
+                last-booking: stacks-block-height
+            })))
+    
+    (map-set discounts discount-id
+        (merge discount { current-uses: (+ (get current-uses discount) u1) }))
+    
+    (update-user-bookings tx-sender booking-id total-cost)
+    (update-owner-earnings (get owner location) owner-payment)
+    
+    (var-set total-platform-fees (+ (var-get total-platform-fees) platform-fee))
+    (var-set booking-id-nonce (+ booking-id u1))
+    (ok booking-id)))
+
 
 
 (define-private (update-user-bookings (user principal) (booking-id uint) (amount uint))
@@ -332,6 +465,12 @@
 
 (define-read-only (get-platform-fees)
   (ok (var-get total-platform-fees)))
+
+(define-read-only (get-discount (discount-id uint))
+  (map-get? discounts discount-id))
+
+(define-read-only (get-active-discounts-for-location (location-id uint))
+  (ok location-id))
 
 ;; title: Location-Rights-Tokenization
 ;; version:
